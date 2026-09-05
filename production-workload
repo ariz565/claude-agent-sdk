@@ -1,0 +1,158 @@
+## Scenario 1: Thundering Herd (the concurrent agent problem)
+
+Signal: 100 agents start at the same time, all hitting the same LLM provider. Provider returns 429 (rate limit). Agents retry with exponential backoff. Queue depth explodes.
+Cause: A batch job kicked off 100 concurrent workflows, or a marketing campaign drove 100 users to hit "analyze my data" at the same time.
+
+Let us decompose the thundering herd into its distinct failure mechanisms, each with the problem, the root cause, and the solution — then tie them into one control plane. The key realization up front:
+
+--- The bottleneck is the provider's quota, not your workers. Everything downstream is a consequence of contending for a shared, rate-limited resource. Most teams scale the wrong thing and make it worse.
+
+The physics you must internalize first
+A long-horizon agent is not one request. It's a stream of LLM calls over time — dozens to hundreds of calls, each large (long context), each consuming two quotas: RPM (requests/min) and TPM (tokens/min). So your aggregate demand is:
+
+demand = active_users × agents_per_user × calls_per_agent × tokens_per_call
+
+For long-context agents, TPM is almost always the binding constraint, not RPM — a single 100K-token call can consume more TPM than a hundred small calls. And the provider's quota is fixed while your demand is bursty. That mismatch is the entire problem.
+
+S1 — The synchronized burst (100 agents start at once)
+Problem: 100 agents begin simultaneously; their first LLM calls land on the provider in the same second.
+Root cause: Bursts are rarely organic. They're self-inflicted or event-driven:
+Cron alignment — every batch job scheduled at 0 * * * * fires at the top of the hour.
+Batch jobs — a nightly ETL kicks off 100 workflows at once.
+Marketing / news events — a campaign or headline drives a traffic spike.
+Retry synchronization — (see S3) a prior 429 wave reschedules everyone at the same instant.
+Solution:
+Admission control at the door: cap concurrent agent starts with a semaphore sized to your provider quota. New starts beyond the cap queue, they don't fail.
+Smoothing (leaky bucket): release agent starts at a steady rate rather than in a spike.
+Stagger cron: never schedule at the top of the hour. Add per-job jitter (0 * * * * → 7,37 * * * * or a random offset). This alone removes a huge class of self-inflicted bursts.
+Deadline-aware admission: if an agent's SLO can't be met given the current queue, reject at the door with a Retry-After rather than admit and miss the SLO.
+If you get it wrong: You admit everything, the provider 429s the whole wave, and you've turned one burst into a retry storm (S3) plus a queue explosion (S4).
+
+S2 — The provider 429 wall (RPM/TPM exhaustion)
+Problem: The provider returns 429 (rate limit) or 529/503 (overloaded) because aggregate demand exceeds quota.
+Root cause: Your quota is shared across all tenants and all agents, and you're consuming it faster than it refills. Because TPM is the binding constraint for long-context agents, a few large agents can exhaust it even when RPM looks fine.
+Solution:
+Treat quota as a first-class resource with a provider-quota scheduler. Maintain a virtual queue per provider key: before an agent issues an LLM call, it must acquire a slot (RPM) and reserve tokens (TPM) against the key's budget. If the budget is full, the call waits or routes elsewhere — you convert a 429 into a routing decision. This is the same reserve/settle pattern we used for money and KV cache.
+Multi-key / multi-provider spread: distribute load across several API keys, regions, and providers. A 429 on one key routes to another.
+Fallback models: on sustained 429, degrade to a cheaper/secondary model or a self-hosted model rather than failing.
+Track consumption in real time: a Redis token bucket per key, decremented on issue, trued-up on the actual usage returned.
+If you get it wrong: You discover the quota only by receiving 429s — i.e., you learn your limit by crashing into it, and every 429 is a user-facing failure.
+
+
+S3 — The retry storm (amplification)
+Problem: 100 agents get 429s and retry with exponential backoff. The retry traffic adds to the load. Queue depth explodes. The system gets worse the harder it tries to recover.
+Root cause: Retries are themselves load, and they're uncoordinated. Each agent retries independently with no global view, so:
+Without jitter, backoff synchronizes (everyone retries at t+1s, t+2s, t+4s) → repeated waves.
+With jitter it's better, but N agents × M retries still multiplies the request rate.
+A retry storm can exceed the original load — the classic congestion collapse.
+Solution:
+Full jitter: sleep = random(0, min(cap, base * 2^attempt)). Desynchronizes retries.
+Respect Retry-After: the provider tells you when to retry; honor it instead of your own guess.
+Retry budget: cap retries per workflow (e.g., 3) AND a global retry budget (retries ≤ 20% of traffic). When the global budget is exhausted, stop retrying and shed instead.
+Circuit breaker per provider: if the 429 rate crosses a threshold, open the breaker and fail fast for a window instead of hammering a provider that can't serve you. Half-open probes test recovery.
+Distinguish retryable from non-retryable: 429/503/timeout retry; 400/401 fail immediately. Retrying a 400 wastes quota.
+Load shedding over retrying: when overloaded, it's better to defer or drop low-priority work than to retry everything.
+If you get it wrong: The retry storm outlives the original burst. You keep hammering a provider that's already saturated, and your own queue fills with retry tasks.
+
+
+S4 — The queue explosion & blocked workers (backpressure)
+Problem: Tasks pile up waiting on LLM calls that keep failing. Queue depth explodes; latency is unbounded; workers are occupied but not making progress.
+Root cause: Each in-flight LLM call holds a worker thread/connection. When the provider is slow or failing, workers are blocked, not working — they occupy capacity while producing nothing. The queue grows because arrivals exceed completions, and completions have stalled.
+Solution:
+Async, non-blocking IO: a worker holds many in-flight calls (event loop), so a slow provider doesn't pin one-thread-per-call.
+Bounded queue with shedding at the door: reject new work with 429 + Retry-After when the queue crosses a threshold. An unbounded queue is a lie — it promises work you can't deliver.
+Deadline-aware shedding: if queue-wait + expected-runtime > the task's deadline, reject at the door rather than waste GPU/provider quota on work that will be late.
+Backpressure propagation: signal upstream (the gateway, the batch scheduler) to slow down, so the pressure is felt at the source, not absorbed in the middle.
+If you get it wrong: You build an ever-growing queue that eventually OOMs or times out en masse — a cliff instead of a graceful slope.
+
+
+S5 — The lost long-horizon work (the 90%-done agent)
+Problem: An agent that has made 50 LLM calls and is 90% done hits a 429. If it fails, you lose all 50 calls of work and the tokens you spent. If it retries forever, it holds resources.
+Root cause: Long-horizon agents have large sunk cost. A naive retry-from-scratch model destroys that value. But holding a blocked agent forever blocks capacity.
+Solution:
+Checkpointing (Temporal + LangGraph checkpointer): persist agent state after each node. On failure or pause, the agent resumes from the last checkpoint, not from scratch. The 50 calls of work are preserved.
+Idempotency: a resumed agent must not double-execute side effects (the idempotency-key pattern).
+Pause-and-resume, not fail: on sustained 429, put the workflow into a durable wait (Temporal wait_condition / timer) and resume when quota frees. This is the long-horizon analog of "don't kill a running turn."
+Cost accounting on resume: track tokens already spent so a resumed agent respects the original budget.
+If you get it wrong: Either you lose expensive partial work on every 429 (wasteful), or you pin resources holding blocked agents (starvation). Checkpoint + pause is the middle path.
+
+
+S6 — The noisy neighbor (one tenant starves the rest)
+Problem: One tenant's burst (or a runaway agent) consumes the shared quota; everyone else gets 429s. Or free users starve paid users.
+Root cause: Shared quota with no per-tenant isolation. A single large consumer can exhaust a resource that hundreds of small consumers needed.
+Solution:
+Per-tenant token buckets / weighted fair queuing: each tenant gets a share of the quota proportional to their tier. A burst by one tenant draws down their bucket, not the global pool.
+Bulkheads: separate queues/pools per tier (paid vs free, batch vs interactive) so a batch burst can't starve interactive users.
+Priority + aging: interactive/paid work preempts batch work; but low priority ages up so it can't starve forever.
+If you get it wrong: Your best customer's agent fails because someone else ran a batch job. That's a churn event, not an incident.
+
+
+S7 — The wrong lever (scaling workers when the provider is the bottleneck)
+Problem: Queue depth explodes, so you scale out workers. It doesn't help — and often makes it worse.
+Root cause: The bottleneck is the provider quota, not your worker count. More workers = more concurrent LLM calls = more 429s = more retries = more load. You've added fuel to a congestion collapse.
+Solution:
+Cap concurrency to the provider quota: use a semaphore / concurrency limiter sized to the provider's limits. Workers beyond that cap add nothing.
+Autoscale on queue depth, but bounded: scale workers to drain the queue up to the concurrency cap, never beyond it.
+Recognize the bottleneck before acting: if 429 rate is high, the fix is demand shaping / quota management / multi-provider — not more workers.
+If you get it wrong: You pay for 100 workers that spend their time receiving 429s. This is the most expensive mistake in the whole list.
+
+S8 — The TPM vs RPM confusion
+Problem: RPM looks fine (you're under the request limit) but you still get 429s.
+Root cause: TPM is the binding constraint for long-context agents. A few 100K-token calls exhaust TPM while RPM stays low. Most monitoring watches RPM and misses TPM.
+Solution:
+Meter both RPM and TPM per key, and alert on TPM specifically.
+Reduce tokens per call: prompt compression, prefix/prompt caching (cached tokens often don't count against TPM the same way), summarize long context, drop stale tool outputs.
+Reserve TPM at admission (the reserve/settle pattern): estimate worst-case tokens, hold them, true-up on actual usage.
+If you get it wrong: You tune for the wrong quota and keep hitting a wall you're not measuring.
+
+The unified control plane (how it all fits)
+
+        burst / batch / campaign
+                 │
+                 ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ ADMISSION (door)  · concurrency semaphore · leaky-bucket   │
+ │ smoothing · stagger cron · deadline-aware reject           │
+ └────────────────────────────────────────────────────────────┘
+                 │ admitted
+                 ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ FAIRNESS  · per-tenant buckets · bulkheads · priority+aging│
+ └────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ PROVIDER-QUOTA SCHEDULER  · virtual queue per key          │
+ │ acquire RPM slot + reserve TPM → wait / route / fallback   │
+ │ circuit breaker per provider · multi-key spread            │
+ └────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ SAFE RETRY  · full jitter · Retry-After · retry budget ·   │
+ │ shed-over-retry · distinguish retryable                    │
+ └────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ PROTECTED LONG-HORIZON WORK  · checkpoint/resume ·         │
+ │ pause-and-resume (durable wait) · idempotency · cost acct  │
+ └────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+        provider (quota respected, not crashed into)
+
+
+# A thundering herd against a rate-limited provider is a contention problem, and the first thing I establish is that the bottleneck is the provider quota, not my workers — so scaling out is the wrong lever and can make it worse. I defend in layers. At the door, admission control and leaky-bucket smoothing shape the burst, and I stagger cron so I don't self-inflict it. I treat quota as a first-class resource with a provider-quota scheduler that reserves RPM and TPM per call and converts a would-be 429 into a routing or wait decision. Retries are made safe with full jitter, Retry-After, a per-workflow and global retry budget, and a circuit breaker so I fail fast instead of hammering. Long-horizon work is protected with checkpointing and pause-and-resume so a 429 doesn't destroy fifty calls of sunk work. Fairness is enforced with per-tenant buckets and bulkheads so one tenant can't starve the rest. And I meter TPM specifically, because for long-context agents TPM is the binding constraint. The result: the burst is smoothed, the quota is respected rather than crashed into, retries don't amplify, and partial work is never lost.
+
+The traps they'll throw
+"Why not just scale workers?" → "The provider quota is fixed; more workers means more concurrent calls means more 429s. I cap concurrency to the quota and shape demand instead."
+"Why not retry harder?" → "Retries are load. A retry storm can exceed the original burst. I budget retries and shed over retrying."
+"RPM is fine, why the 429s?" → "TPM is the binding constraint for long-context agents. I meter and reserve TPM, not just RPM."
+"What about the agent that's 90% done?" → "Checkpoint + pause-and-resume. I never lose sunk work to a 429, and I never pin resources holding a blocked agent."
+
+The one-liner
+"Shape the burst, schedule the quota, budget the retries, protect the sunk work — and never scale into a fixed quota."
+
+
+
